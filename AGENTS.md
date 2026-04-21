@@ -25,35 +25,48 @@ After implementation is complete, run `cargo build --release`. The plugin direct
 ### Entry Points
 
 The binary has two modes controlled by CLI args (`src/cli/mod.rs`):
-1. **TUI mode** (`src/main.rs`) — default, renders the sidebar UI
-2. **CLI subcommands** — `hook`, `toggle`, `auto-close`, `set-status`, `--version`
+1. **TUI mode** — default. `src/main.rs` handles CLI arg parsing, SIGUSR1 signal wiring, and TUI session setup, then delegates to `app::run` (`src/app.rs`) for the event loop.
+2. **CLI subcommands** — `setup`, `hook`, `toggle`, `toggle-all`, `auto-close`, `set-status`, `spawn`, `capture`, `--version` / `version`.
 
 ### Core Data Flow
 
 ```
-Agent hooks (hook.sh) → CLI `hook` subcommand → writes to /tmp/tmux-agent-sidebar-*
-                                                        ↓
-TUI event loop (main.rs) → AppState::sync_global_state() → reads tmux panes + /tmp files
-                                                        ↓
-                                            ui::draw() renders frame
+Agent hooks (hook.sh) → CLI `hook` subcommand
+                           ↓
+        adapter/ normalizes raw JSON into AgentEventKind
+                           ↓
+        event/ builds an internal AgentEvent
+                           ↓
+        cli/hook/handlers dispatches on_* per event, which:
+          • sets tmux pane options (@pane_status, @pane_attention, etc.)
+          • appends to /tmp/tmux-agent-activity*.log
+                           ↓
+TUI event loop (app::run) → AppState::sync_global_state()
+          • reads tmux panes via single `list-panes -a`
+          • parses /tmp/tmux-agent-activity*.log
+                           ↓
+                ui::draw() renders frame
 ```
 
 ### Key Modules
 
 - **`state.rs` + `state/`** — `AppState` central struct plus topical submodules (`activity`, `session`, `focus`, `scroll`, `pane_runtime`, `layout`, `popup`, `notices`, `timers`, `filter`, `global`, `refresh`, `tab`). All UI is computed from this state.
+- **`app.rs` + `app/`** — TUI orchestration: `setup` (prime `AppState`), `workers` (background git/session/version threads), `input` (keyboard/mouse handling), `render` (per-frame render entry). Split out from `main.rs` so the binary entry point only handles CLI dispatch, signal wiring, and TUI session setup.
 - **`tmux.rs`** — Tmux integration: queries all panes via single `list-panes -a` call, defines `PaneInfo`/`PaneStatus`/`AgentType`/`PermissionMode`/`WorktreeMetadata`.
+- **`adapter/`** — Per-agent hook adapters (`claude`, `codex`, `opencode`). Each exposes a `HOOK_REGISTRATIONS` table binding upstream hook triggers to an internal `AgentEventKind`, plus a `parse()` that maps raw JSON payloads into `AgentEvent`. Single source of truth consumed by the setup wizard, README snippets, and tests.
+- **`event.rs` + `event/`** — Internal event layer: `AgentEvent` (pre-extracted fields; handlers never touch raw JSON or agent names), `AgentEventKind` (compile-time enum for hook kinds), `EventAdapter` trait + `resolve_adapter`.
 - **`cli/hook.rs` + `cli/hook/`** — Receives real-time status updates from agent hooks; dispatch in `hook.rs`, with submodules `context` (shared helpers + `AgentContext`), `handlers` (per-event `on_*` handlers), `activity` (activity log writing), `notifications` (desktop notification helpers).
 - **`git.rs`** — Git operations (branch, ahead/behind, PR numbers via `gh` CLI, diff stats). Runs in a background polling thread.
 - **`activity.rs`** — Parses `/tmp/tmux-agent-activity*.log` files, maps tool types to colors.
 - **`group.rs`** — Groups panes by repository path.
-- **`ui/`** — Rendering layer: `panes.rs` (agent list + repo filter) with submodules (`filter_bar`, `row`, `row_collector`, `click_targets`, `popups`); `bottom.rs` (activity/git tabs); `colors.rs` (256-color theme); `text.rs` (text formatting/truncation).
+- **`session.rs` / `worktree.rs` / `tool_name.rs` / `version.rs` / `port.rs` / `clipboard.rs` / `desktop_notification.rs`** — Leaf helpers used across modules (session name resolution, worktree metadata parsing, tool-name classification, version reporting, port detection, clipboard + desktop notification shims).
+- **`ui/`** — Rendering layer: `mod.rs` (entry `draw`), `panes.rs` (agent list + repo filter) with submodules (`filter_bar`, `row`, `row_collector`, `click_targets`, `popups`); `bottom.rs` + `bottom/` with submodules (`activity`, `git`) for the activity/git tabs; `colors.rs` (256-color theme); `icons.rs` (agent/status glyphs); `notices.rs` (transient banner rendering); `text.rs` (text formatting/truncation).
 
 ### State Management
 
-- `Focus` enum: Filter, Panes, ActivityLog — controls keyboard input routing
-- `StatusFilter`: All, Running, Waiting, Idle, Error
-- `BottomTab`: Activity, GitStatus
-- SIGUSR1 signal triggers instant refresh on tmux pane focus change
+See `docs/state-management.md` for the full scope/update-frequency table, per-pane tmux options, data flow, and key type definitions.
+
+Process-level detail not covered there: SIGUSR1 triggers an instant refresh on tmux pane focus change (handler in `src/main.rs` flips a shared `AtomicBool` that the `app::run` loop polls).
 
 ### Testing
 
