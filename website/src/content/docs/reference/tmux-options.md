@@ -19,10 +19,11 @@ Most options must be set **before** loading the plugin in your `tmux.conf`. Colo
 
 ## Worktree spawn defaults
 
-| Option                            | Default  | Description                                  |
-| --------------------------------- | -------- | -------------------------------------------- |
-| `@agent-sidebar-default-agent`    | `claude` | Agent launched by `n`&nbsp;(also accepts `codex`) |
-| `@agent-sidebar-branch-prefix`    | `agent/` | Branch prefix for new worktrees              |
+| Option                            | Default     | Description                                               |
+| --------------------------------- | ----------- | --------------------------------------------------------- |
+| `@agent-sidebar-default-agent`    | `claude`    | Agent launched by `n`&nbsp;(also accepts `codex`)         |
+| `@agent-sidebar-branch-prefix`    | `agent/`    | Branch prefix for new worktrees                           |
+| `@agent-sidebar-worktree-dir`     | `.worktrees` | Repo-relative directory for sidebar-spawned worktrees; absolute paths and `..` are rejected |
 
 ## Status and filter colors
 

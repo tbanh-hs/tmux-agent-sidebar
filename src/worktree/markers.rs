@@ -77,11 +77,11 @@ mod tests {
 
     #[test]
     fn parse_all_fields_populated() {
-        let raw = "1\n/repo\n/repo-worktrees/foo\nagent/foo\n@42\n";
+        let raw = "1\n/repo\n/repo/.worktrees/foo\nagent/foo\n@42\n";
         let m = SpawnMarkers::parse(raw);
         assert!(m.spawned);
         assert_eq!(m.from_repo, "/repo");
-        assert_eq!(m.worktree_path, "/repo-worktrees/foo");
+        assert_eq!(m.worktree_path, "/repo/.worktrees/foo");
         assert_eq!(m.branch, "agent/foo");
         assert_eq!(m.window_id, "@42");
         assert!(m.is_spawned());
