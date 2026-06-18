@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::process::{ProcessSnapshot, command_basename};
@@ -143,6 +144,7 @@ fn build_session_hierarchy(
 ) -> (SessionMap, Vec<CodexPidEntry>) {
     let mut sessions_map: SessionMap = indexmap::IndexMap::new();
     let mut codex_pids: Vec<CodexPidEntry> = Vec::new();
+    let mut seen_pids: HashSet<u32> = HashSet::new();
 
     for line in all_panes_output.lines() {
         let parts = split_tmux_fields(line, '|');
@@ -157,6 +159,17 @@ fn build_session_hierarchy(
         // inside a pane field (cwd, prompt, branch) back into a field
         // separator and shift every downstream index.
         let pane_fields = &parts[session_line_field::PANE_LINE_OFFSET..];
+
+        // Deduplicate panes shared across grouped sessions:
+        // same pane_pid may appear in multiple sessions, keep only
+        // the first occurrence. pane_pid is at index 13 in pane_fields.
+        if let Some(pid_str) = pane_fields.get(pane_line_field::PANE_PID) {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid != 0 && !seen_pids.insert(pid) {
+                    continue;
+                }
+            }
+        }
 
         let sessions_entry = sessions_map.entry(session_name.to_string()).or_default();
 
@@ -1219,5 +1232,82 @@ mod tests {
         let sessions = finalize_sessions(sessions_map);
 
         assert!(sessions.is_empty(), "session with no panes must be dropped");
+    }
+
+    // ─── build_session_hierarchy dedup ─────────────────────────────
+
+    /// Construct a minimal valid pane line for `build_session_hierarchy`
+    /// with the given session name and pane_pid. All other fields are
+    /// empty/defaults — enough to survive parsing as an opencode pane.
+    fn make_full_pane_line(session_name: &str, pane_pid: u32) -> String {
+        // Field layout (pane_format):
+        // 0:session_name|1:window_id|2:window_index|3:window_name|
+        // 4:window_active|5:automatic-rename|6:pane_active|7:@pane_status|
+        // 8:@pane_attention|9:@pane_agent|10:@pane_name|
+        // 11:pane_current_path|12:pane_current_command|13:@pane_role|
+        // 14:pane_id|15:@pane_prompt|16:@pane_prompt_source|
+        // 17:@pane_started_at|18:@pane_wait_reason|19:pane_pid|
+        // 20:@pane_subagents|21:@pane_cwd|22:@pane_permission_mode|
+        // 23:@pane_worktree_name|24:@pane_worktree_branch|
+        // 25:@pane_session_id|26:@agent-sidebar-spawned|27:@pane_bg_cmd
+        // 28 total fields (MIN_FIELDS = 28)
+        let mut fields: Vec<&str> = vec![""; 28];
+        fields[0] = session_name;
+        fields[1] = "@0"; // window_id
+        fields[3] = "win"; // window_name
+        fields[4] = "1"; // window_active
+        fields[9] = "opencode"; // @pane_agent
+        fields[11] = "/tmp"; // pane_current_path
+        fields[14] = "%0"; // pane_id
+        fields[21] = "/tmp"; // @pane_cwd
+        let pid_str = pane_pid.to_string();
+        fields[19] = &pid_str; // pane_pid
+        fields.join("|")
+    }
+
+    #[test]
+    fn build_session_hierarchy_dedups_nonzero_pane_pid_only() {
+        // Two rows with same non-zero pane_pid: only the first is retained.
+        let line_a = make_full_pane_line("primary", 42);
+        let line_b = make_full_pane_line("grouped", 42);
+        // Two more rows with pane_pid = 0: both retained (no dedup on zero).
+        let line_c = make_full_pane_line("primary", 0);
+        let line_d = make_full_pane_line("grouped", 0);
+
+        let input = format!("{line_a}\n{line_b}\n{line_c}\n{line_d}");
+        let (sessions_map, _) = build_session_hierarchy(&input, None);
+        let sessions = finalize_sessions(sessions_map);
+
+        // Should produce two sessions: "primary" and "grouped"
+        assert_eq!(sessions.len(), 2);
+
+        let primary = sessions
+            .iter()
+            .find(|s| s.session_name == "primary")
+            .unwrap();
+        let grouped = sessions
+            .iter()
+            .find(|s| s.session_name == "grouped")
+            .unwrap();
+
+        // primary: non-zero pane (42) + zero pane (0) — both retained
+        assert_eq!(
+            primary.windows[0].panes.len(),
+            2,
+            "primary session should have both pane 42 and pane 0"
+        );
+
+        // grouped: panes with pane_pid 42 and 42 are duplicates,
+        // so 42 is skipped. Only pane 0 is retained (no dedup on zero).
+        assert_eq!(
+            grouped.windows[0].panes.len(),
+            1,
+            "grouped session should only have pane 0 (pane 42 was deduped)"
+        );
+        assert_eq!(
+            grouped.windows[0].panes[0].pane_pid,
+            Some(0),
+            "retained pane should be the zero-pid one"
+        );
     }
 }
