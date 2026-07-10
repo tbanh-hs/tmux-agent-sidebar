@@ -65,10 +65,22 @@ impl DesktopNotificationEvent {
     }
 }
 
+/// Default sound name used when the sound option is enabled without an
+/// explicit name (`@sidebar_notification_sound on`). macOS resolves this
+/// against /System/Library/Sounds; other platforms treat it as a freedesktop
+/// event id for a best-effort player.
+#[cfg(target_os = "macos")]
+const DEFAULT_SOUND_NAME: &str = "Ping";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_SOUND_NAME: &str = "message";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopNotificationSettings {
     pub enabled: bool,
     pub events: HashSet<DesktopNotificationEvent>,
+    /// `Some(name)` plays a sound alongside the notification; `None` is silent.
+    /// On macOS `name` is a system sound name; elsewhere it's a best-effort id.
+    pub sound: Option<String>,
 }
 
 impl Default for DesktopNotificationSettings {
@@ -76,6 +88,7 @@ impl Default for DesktopNotificationSettings {
         Self {
             enabled: true,
             events: DesktopNotificationEvent::DEFAULT.iter().copied().collect(),
+            sound: None,
         }
     }
 }
@@ -94,8 +107,13 @@ impl DesktopNotificationSettings {
         let events = opts
             .get(tmux::SIDEBAR_NOTIFICATIONS_EVENTS)
             .map_or_else(|| Self::default().events, |raw| parse_events(raw));
+        let sound = parse_sound(opts.get(tmux::SIDEBAR_NOTIFICATION_SOUND));
 
-        Self { enabled, events }
+        Self {
+            enabled,
+            events,
+            sound,
+        }
     }
 
     pub fn from_tmux() -> Self {
@@ -119,6 +137,23 @@ fn parse_events(raw: &str) -> HashSet<DesktopNotificationEvent> {
         .split(',')
         .filter_map(DesktopNotificationEvent::from_token)
         .collect()
+}
+
+/// Parse the `@sidebar_notification_sound` option into an optional sound name.
+///
+/// - unset / empty / `off` / `false` / `none` / `no` → `None` (silent, default)
+/// - `on` / `true` / `yes` / `default` → the platform [`DEFAULT_SOUND_NAME`]
+/// - anything else → that literal value, used verbatim as the sound name
+fn parse_sound(raw: Option<&String>) -> Option<String> {
+    let trimmed = raw.map(|s| s.trim()).unwrap_or("");
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "off" | "false" | "none" | "no" | "0" => None,
+        "on" | "true" | "yes" | "default" | "1" => Some(DEFAULT_SOUND_NAME.to_string()),
+        _ => Some(trimmed.to_string()),
+    }
 }
 
 pub fn format_title(repo: Option<&str>, branch: Option<&str>, agent: &str) -> String {
@@ -182,7 +217,7 @@ pub fn notify_if_allowed(
         return false;
     }
 
-    match send_desktop_notification(title, body) {
+    match send_desktop_notification(title, body, settings.sound.as_deref()) {
         Ok(()) => {
             tmux::set_pane_option(pane_id, key, &encode_stamp(now, &normalized_fingerprint));
             true
@@ -232,20 +267,33 @@ fn normalize_fingerprint(value: &str) -> String {
     value.replace(['|', '\n', '\r'], " ")
 }
 
-fn send_desktop_notification(title: &str, body: &str) -> Result<(), String> {
+fn send_desktop_notification(title: &str, body: &str, sound: Option<&str>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            escape_applescript(body),
-            escape_applescript(title)
-        );
+        let script = build_applescript(title, body);
         let mut command = Command::new("osascript");
         command
             .args(["-e", &script])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        run_notification_command(&mut command, "osascript", DESKTOP_NOTIFICATION_TIMEOUT)
+        let result =
+            run_notification_command(&mut command, "osascript", DESKTOP_NOTIFICATION_TIMEOUT);
+        // Play the sound with `afplay` rather than the AppleScript
+        // `sound name` clause. `display notification ... sound name` routes
+        // through the macOS *alert* volume (often 0) and is silenced by Focus
+        // / per-app notification-sound settings, so the banner shows but is
+        // mute. `afplay` uses the main output volume and always plays.
+        // Fire-and-forget: a failed play must never fail the notification.
+        if result.is_ok()
+            && let Some(path) = sound.and_then(resolve_macos_sound_path)
+        {
+            let _ = Command::new("afplay")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        result
     }
 
     #[cfg(target_os = "linux")]
@@ -260,20 +308,73 @@ fn send_desktop_notification(title: &str, body: &str) -> Result<(), String> {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        run_notification_command(&mut command, "notify-send", DESKTOP_NOTIFICATION_TIMEOUT)
+        let result =
+            run_notification_command(&mut command, "notify-send", DESKTOP_NOTIFICATION_TIMEOUT);
+        // notify-send has no portable sound argument, so play a best-effort
+        // sound via libcanberra when one is configured. Fire-and-forget: a
+        // missing player must never fail the visual notification we just sent.
+        if result.is_ok()
+            && let Some(name) = sound.map(str::trim).filter(|s| !s.is_empty())
+        {
+            let _ = Command::new("canberra-gtk-play")
+                .args(["-i", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        result
     }
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (title, body);
+        let _ = (title, body, sound);
         Err("desktop notifications are not supported on Windows yet".into())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = (title, body);
+        let _ = (title, body, sound);
         Err("desktop notifications are not supported on this platform".into())
     }
+}
+
+/// Build the AppleScript for a macOS `display notification` (visual only —
+/// sound is played separately via `afplay`). Factored out so the escaping is
+/// unit-testable without spawning `osascript`.
+#[cfg(target_os = "macos")]
+fn build_applescript(title: &str, body: &str) -> String {
+    format!(
+        "display notification \"{}\" with title \"{}\"",
+        escape_applescript(body),
+        escape_applescript(title)
+    )
+}
+
+/// Resolve a configured sound value to a file path `afplay` can play.
+///
+/// - a value containing `/` is treated as a path and returned only if it exists
+/// - a bare name (e.g. `Glass`) is resolved against the system and user sound
+///   libraries (`/System/Library/Sounds`, `~/Library/Sounds`), `.aiff` first
+///
+/// Returns `None` when nothing matches, so an unknown name is silently a no-op.
+#[cfg(target_os = "macos")]
+fn resolve_macos_sound_path(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name.contains('/') {
+        return std::path::Path::new(name)
+            .is_file()
+            .then(|| name.to_string());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    [
+        format!("/System/Library/Sounds/{name}.aiff"),
+        format!("{home}/Library/Sounds/{name}.aiff"),
+    ]
+    .into_iter()
+    .find(|candidate| std::path::Path::new(candidate).is_file())
 }
 
 fn notification_backend_available() -> bool {
@@ -394,6 +495,88 @@ mod tests {
         let opts = HashMap::new();
         let settings = DesktopNotificationSettings::from_tmux_options_with_backend(&opts, false);
         assert!(!settings.enabled);
+    }
+
+    #[test]
+    fn parse_sound_off_variants_return_none() {
+        for raw in ["", "   ", "off", "Off", "false", "none", "no", "0"] {
+            assert_eq!(parse_sound(Some(&raw.to_string())), None, "{raw:?}");
+        }
+        assert_eq!(parse_sound(None), None);
+    }
+
+    #[test]
+    fn parse_sound_on_variants_use_default_name() {
+        for raw in ["on", "ON", "true", "yes", "default", "1"] {
+            assert_eq!(
+                parse_sound(Some(&raw.to_string())).as_deref(),
+                Some(DEFAULT_SOUND_NAME),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_sound_custom_name_is_used_verbatim() {
+        assert_eq!(
+            parse_sound(Some(&"Glass".to_string())).as_deref(),
+            Some("Glass")
+        );
+        assert_eq!(
+            parse_sound(Some(&"  Submarine  ".to_string())).as_deref(),
+            Some("Submarine")
+        );
+    }
+
+    #[test]
+    fn settings_parse_sound_from_option() {
+        let mut opts = HashMap::new();
+        opts.insert(tmux::SIDEBAR_NOTIFICATION_SOUND.into(), "Glass".into());
+        let settings = DesktopNotificationSettings::from_tmux_options_with_backend(&opts, true);
+        assert_eq!(settings.sound.as_deref(), Some("Glass"));
+    }
+
+    #[test]
+    fn settings_sound_defaults_to_none_when_unset() {
+        let opts = HashMap::new();
+        let settings = DesktopNotificationSettings::from_tmux_options_with_backend(&opts, true);
+        assert_eq!(settings.sound, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_applescript_formats_visual_notification() {
+        assert_eq!(
+            build_applescript("Title", "Body"),
+            "display notification \"Body\" with title \"Title\""
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_sound_path_resolves_system_sound_name() {
+        // Glass ships with every macOS install.
+        assert_eq!(
+            resolve_macos_sound_path("Glass").as_deref(),
+            Some("/System/Library/Sounds/Glass.aiff")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_sound_path_unknown_or_blank_is_none() {
+        assert_eq!(resolve_macos_sound_path("NoSuchSound12345"), None);
+        assert_eq!(resolve_macos_sound_path("   "), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_sound_path_absolute_path_passthrough_when_exists() {
+        assert_eq!(
+            resolve_macos_sound_path("/System/Library/Sounds/Glass.aiff").as_deref(),
+            Some("/System/Library/Sounds/Glass.aiff")
+        );
+        assert_eq!(resolve_macos_sound_path("/no/such/file.aiff"), None);
     }
 
     #[test]

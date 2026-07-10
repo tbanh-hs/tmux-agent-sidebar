@@ -104,6 +104,7 @@ mod tests {
         desktop_notification::DesktopNotificationSettings {
             enabled: false,
             events: Default::default(),
+            sound: None,
         }
     }
 
@@ -293,6 +294,7 @@ mod tests {
             events: [desktop_notification::DesktopNotificationEvent::Stop]
                 .into_iter()
                 .collect(),
+            sound: None,
         }
     }
 

@@ -56,6 +56,7 @@ mod tests {
         desktop_notification::DesktopNotificationSettings {
             enabled: false,
             events: Default::default(),
+            sound: None,
         }
     }
 

@@ -78,6 +78,14 @@ const extractPromptText = (parts) => {
 export const TmuxAgentSidebar = async ({ directory }) => {
   const cwd = typeof directory === "string" ? directory : "";
 
+  // OpenCode creates its session lazily — `session.created` is not emitted
+  // until the first message — so without this the pane would stay invisible
+  // in the sidebar until the user types a prompt. This factory runs once at
+  // plugin load (TUI startup), so fire session-start here to mark the pane as
+  // an idle opencode agent immediately. The hook subprocess targets the pane
+  // via $TMUX_PANE, inherited from this process.
+  hook("session-start", { cwd, session_id: "", source: "startup" });
+
   return {
     "chat.message": async (input, output) => {
       const session_id =
